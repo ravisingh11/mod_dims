@@ -1,20 +1,20 @@
 # mod-dims Docker Container
 
-# How to build this image
+## Build
 
+```bash
+$ docker build -t mod-dims:latest -f docker/Dockerfile .
 ```
-$ docker build -t mod-dims:latest -f Dockerfile ..
-```
 
-# How to use this image
+## Run
 
-## Set DIMS_SECRET to use /dims4/ based signed URLs
+### Set DIMS_SECRET to use /dims4/ based signed URLs
 
 ```shell
 $ docker run -e DIMS_SECRET=mysecret mod-dims:latest
 ```
 
-## Enable stronger /dims4/ signatures (HMAC + strict validation)
+### Enable stronger /dims4/ signatures (HMAC + strict validation)
 
 ```shell
 $ docker run \
@@ -24,21 +24,22 @@ $ docker run \
   mod-dims:latest
 ```
 
-## Set DIMS_WHITELIST to use /dims3/ based URLs
+### Set DIMS_WHITELIST to use /dims3/ based URLs
 
 ```shell
 $ docker run -e DIMS_WHITELIST="images.pexels.com" mod-dims:latest
 ```
 
-# Configuration
+## Configuration
 
 | Environment Variables | Description | Default |
 |-----------------------|-------------|---------|
 | `DIMS_CLIENT` | Name of client | development |
 | `DIMS_SECRET` | Shared secret for /dims4/ signatures | "" |
+| `DIMS_WHITELIST` | Space-delimited whitelist domains for `/dims3/` URL fetches | (required for `/dims3/`) |
 | `DIMS_DOWNLOAD_TIMEOUT` | Max time allowed for downloading source images, in milliseconds. | 60000 |
 | `DIMS_CONNECT_TIMEOUT` | Max time allowed to establish upstream connection, in milliseconds. | 1000 |
-| `DIMS_IMAGEMAGICK_TIMEOUT` | Max time allowed for Imagemagick processing, in milliseconds. | 20000 |
+| `DIMS_IMAGEMAGICK_TIMEOUT` | Max time allowed for ImageMagick processing, in milliseconds. | 20000 |
 | `DIMS_MAX_DOWNLOAD_BYTES` | Hard cap for downloaded source image size, in bytes. | 67108864 |
 | `DIMS_MAX_REDIRECTS` | Max redirect hops for upstream fetches. | 5 |
 | `DIMS_ALLOWED_FETCH_SCHEMES` | Comma-separated allowed upstream schemes. | `http,https` |
@@ -46,6 +47,7 @@ $ docker run -e DIMS_WHITELIST="images.pexels.com" mod-dims:latest
 | `DIMS_ENCRYPTION_ALGORITHM` | `eurl` algorithm (`AES/GCM/NoPadding` or `AES/ECB/PKCS5Padding`). | `AES/GCM/NoPadding` |
 | `DIMS_ALLOW_LEGACY_ECB` | Allow legacy ECB encrypted URLs (`true`/`false`). | `false` |
 | `DIMS_NO_IMAGE_URL` | URL (http(s):// or file:///) to an image displayed for errors | "http://placehold.it/350x150" |
+| `DIMS_DEFAULT_IMAGE_URL` | URL used as default/fallback image | "http://placehold.it/350x150" |
 | `DIMS_CACHE_CONTROL_MAX_AGE` | Cache control max age header setting, in seconds | 604800 |
 | `DIMS_EDGE_CONTROL_DOWNSTREAM_TTL` | Edge control downstream TTL | 604800 |
 | `DIMS_TRUST_SOURCE` | Whether or not to trust origin cache headers | true |

@@ -2,7 +2,7 @@ Dependencies
 ============
 
 * Apache 2.4+
-* Imagemagick 6.9+ or 7.x (Docker/devcontainer pins 7.1.2-13)
+* ImageMagick 6.9+ or 7.x (Docker/devcontainer pins 7.1.2-13)
 * libcurl 8+
 
 Testing
@@ -23,12 +23,22 @@ Run performance smoke benchmark (quick p95 guardrail):
 Compiling
 =========
 
-./autorun.sh --with-imagemagick=/path/to/imagemagick --with-apache=/path/to/apache
+Run a local build:
+
+    ./autorun.sh
+    ./configure
+    make -j"$(nproc)"
+
+If Apache/ImageMagick are installed in non-default prefixes, pass them to `./configure`:
+
+    ./configure --with-imagemagick=/path/to/imagemagick --with-apache=/path/to/apache
+    make -j"$(nproc)"
 
 The paths provided above are prefix paths used to install those dependencies. If you installed
-Imagemagick and Apache (including APR) in /usr/local you would run:
+ImageMagick and Apache (including APR) in /usr/local you would run:
 
-./autorun.sh --with-imagemagick=/usr/local --with-apache=/usr/local
+    ./configure --with-imagemagick=/usr/local --with-apache=/usr/local
+    make -j"$(nproc)"
 
 Installation
 ============
@@ -36,10 +46,10 @@ Installation
 Add the following to the Apache configuration:
 
     <IfModule !mod_dims.c>
-        LoadModule dims_module modules/mod_dims.so
+        LoadModule dims_module modules/libmod_dims.so
     </IfModule>
 
-    AddHandler dims-local .gif .jpg
+    AddHandler dims-local .gif .jpg .png
 
     <Location /dims/>
         SetHandler dims
@@ -47,6 +57,10 @@ Add the following to the Apache configuration:
 
     <Location /dims3/>
         SetHandler dims3
+    </Location>
+
+    <Location /dims4/>
+        SetHandler dims4
     </Location>
 
     <Location /dims-status/>
@@ -69,7 +83,7 @@ Add the following to the Apache configuration:
     # DimsFetchConnectionReuse true
     # DimsMaxConcurrentFetchesPerChild 32
 
-This assumes mod_dims.so has been installed in $HTTP_ROOT/modules.
+This assumes `libmod_dims.so` has been installed in `$HTTP_ROOT/modules`.
 
 Security Modes
 ==============
@@ -172,8 +186,8 @@ There are three classes of errors in mod_dims;
 - Errors caused during downloading of a source image.  These
   come directly from libcurl and are logged as-is.
 
-- Errors caused during an ImageMagick operation.  These come
-  directly from ImageMagik and are logged as-is.
+- Errors caused during an ImageMagick operation. These
+  come directly from ImageMagick and are logged as-is.
 
 - Errors caused during processing of a request by mod_dims.  These
   fall into the category of bad input checking, bad config, etc.
@@ -181,7 +195,7 @@ There are three classes of errors in mod_dims;
 ImageMagick Timeout Error Format:
 ---------------------------------
 
-[client <client ip address> Imagemagick operation, '<operation>', timed out after 4 ms
+[client <client ip address>] ImageMagick operation, '<operation>', timed out after 4 ms
 
 <operation> would be something like "Resize/Image" or "Save/Image".
 
@@ -194,13 +208,13 @@ Errors will be in the following format in Apache's error log:
 
 For example:
 
-[client 10.181.182.244] Imagemagick error, 'no decode delegate for this image
+[client 10.181.182.244] ImageMagick error, 'no decode delegate for this image
 format `'', on request: /20080803WI55426251_WI.jpg/TEST/thumbnail/78x100/
 
 Common libcurl Error Messages:
 ------------------------------
 
-These message are usually self explanatory so no explain is provided.  The 
+These messages are usually self-explanatory, so no additional explanation is provided. The
 URL that failed will be logged along with this message.
 
 * Couldn't connect to server
@@ -228,7 +242,7 @@ Common ImageMagick Error Messages:
 
 * unrecognized image format
 * no decode delegate for this image format
->    This happens when ImageMagick doesn't no how to read a source image.
+>    This happens when ImageMagick doesn't know how to read a source image.
 
 * zero-length blob not permitted
 >    This may occur if there was a failure to download the source image.
