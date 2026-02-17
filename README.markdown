@@ -2,7 +2,7 @@ Dependencies
 ============
 
 * Apache 2.4+
-* ImageMagick 6.9+ or 7.x (Docker/devcontainer pins 7.1.2-13)
+* ImageMagick 6.9+ or 7.x (Docker/devcontainer builds fetch the latest release tarball at build time)
 * libcurl 8+
 
 Testing
@@ -19,6 +19,10 @@ Run end-to-end hardening integration tests (requires Docker, Python 3, OpenSSL, 
 Run performance smoke benchmark (quick p95 guardrail):
 
     ./tests/perf-smoke.sh
+
+Run the full wired test suite via automake:
+
+    make check
 
 QA: Test with Custom JPG/PNG/WebP Files
 =======================================
@@ -59,6 +63,13 @@ Run a local build:
     ./autorun.sh
     ./configure
     make -j"$(nproc)"
+
+Use centralized developer/sanitizer build profiles:
+
+    make dev-build
+    make dev-check
+    make sanitize-build
+    make sanitize-check
 
 If Apache/ImageMagick are installed in non-default prefixes, pass them to `./configure`:
 

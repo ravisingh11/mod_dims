@@ -8,6 +8,31 @@ AC_PROG_CC
 AC_PROG_INSTALL
 AC_PROG_LIBTOOL
 
+AC_ARG_ENABLE([dev-warnings],
+  AS_HELP_STRING([--enable-dev-warnings], [enable additional developer warning flags]),
+  [enable_dev_warnings="$enableval"],
+  [enable_dev_warnings="no"])
+
+AC_ARG_ENABLE([sanitizers],
+  AS_HELP_STRING([--enable-sanitizers], [enable AddressSanitizer and UndefinedBehaviorSanitizer flags]),
+  [enable_sanitizers="$enableval"],
+  [enable_sanitizers="no"])
+
+DEV_WARNING_CFLAGS=""
+if test "x$enable_dev_warnings" = "xyes"; then
+  DEV_WARNING_CFLAGS="-Wall -Wextra -Wpedantic -Wformat=2 -Wshadow"
+fi
+AC_SUBST([DEV_WARNING_CFLAGS])
+
+SANITIZER_CFLAGS=""
+SANITIZER_LDFLAGS=""
+if test "x$enable_sanitizers" = "xyes"; then
+  SANITIZER_CFLAGS="-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined"
+  SANITIZER_LDFLAGS="-fsanitize=address,undefined"
+fi
+AC_SUBST([SANITIZER_CFLAGS])
+AC_SUBST([SANITIZER_LDFLAGS])
+
 # Check for ImageMagick (support both IM6 and IM7 pkg-config names)
 PKG_CHECK_MODULES([MagickCore], [MagickCore], [], [
   PKG_CHECK_MODULES([MagickCore], [MagickCore-7.Q16HDRI], [], [

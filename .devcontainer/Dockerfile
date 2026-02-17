@@ -3,7 +3,6 @@ ARG HTTPD_VERSION=2.4.52
 FROM httpd:${HTTPD_VERSION} AS build-mod-dims
 
 ARG DIMS_VERSION=3.3.31
-ARG IMAGEMAGICK_VERSION=7.1.2-13
 ARG WEBP_VERSION=1.6.0
 ARG TIFF_VERSION=4.7.1
 ARG PREFIX=/usr/local/imagemagick
@@ -61,11 +60,12 @@ RUN wget http://download.osgeo.org/libtiff/tiff-${TIFF_VERSION}.tar.gz && \
     ./configure --prefix=$PREFIX --with-webp-include-dir=$PREFIX/include --with-webp-lib-dir=$PREFIX/lib && \
     make -j4 && make install
 
-# Imagemagick
-RUN wget https://download.imagemagick.org/ImageMagick/download/releases/ImageMagick-${IMAGEMAGICK_VERSION}.tar.xz && \
+# ImageMagick (latest release tarball)
+RUN wget -O ImageMagick.tar.xz https://download.imagemagick.org/archive/ImageMagick.tar.xz && \
     export PKG_CONFIG_PATH=$PREFIX/lib/pkgconfig && \
-    tar xvf ImageMagick-${IMAGEMAGICK_VERSION}.tar.xz && \
-    cd ImageMagick-${IMAGEMAGICK_VERSION} && \
+    IMAGEMAGICK_SRC_DIR="$(tar -tf ImageMagick.tar.xz | head -1 | cut -d/ -f1)" && \
+    tar xvf ImageMagick.tar.xz && \
+    cd "${IMAGEMAGICK_SRC_DIR}" && \
     ./configure --without-x --with-quantum-depth=8 --prefix=$PREFIX && \
     make -j4 && make install
 
