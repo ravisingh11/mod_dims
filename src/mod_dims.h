@@ -128,6 +128,11 @@ struct dims_config_rec {
     int log_sensitive_data;
     int allow_legacy_ecb;
     char *default_output_format;
+    int status_extended;
+    int enable_op_cache;
+    long op_cache_size;
+    int fetch_connection_reuse;
+    long max_concurrent_fetches_per_child;
 
     MagickSizeType area_size;
     MagickSizeType memory_size;
@@ -221,6 +226,9 @@ struct dims_request_rec {
     /* Should Content-Disposition header bet set. */
     int send_content_disposition;
     char *content_disposition_filename;
+
+    /* Parsed command list cache reference for this request. */
+    void *parsed_commands_cache_ref;
 };
 
 #endif

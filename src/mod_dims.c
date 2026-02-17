@@ -59,9 +59,14 @@
 module dims_module; 
 
 #define DIMS_CURL_SHARED_KEY "dims_curl_shared"
+#define DIMS_OP_CACHE_KEY "dims_op_cache"
 #define DIMS_DEFAULT_CONNECT_TIMEOUT 1000
 #define DIMS_DEFAULT_MAX_DOWNLOAD_BYTES (64L * 1024L * 1024L)
 #define DIMS_DEFAULT_MAX_REDIRECTS 5
+#define DIMS_DEFAULT_OP_CACHE_SIZE 10000
+#define DIMS_DEFAULT_MAX_CONCURRENT_FETCHES_PER_CHILD 32
+#define DIMS_LATENCY_BUCKET_BOUND_COUNT 12
+#define DIMS_LATENCY_BUCKET_COUNT (DIMS_LATENCY_BUCKET_BOUND_COUNT + 1)
 
 #define MAGICK_CHECK(func, d) \
     do {\
@@ -78,7 +83,31 @@ typedef struct {
 
     apr_thread_mutex_t *share_mutex;
     apr_thread_mutex_t *dns_mutex;
+    apr_queue_t *easy_queue;
+    volatile apr_uint32_t active_fetches;
 } dims_curl_rec;
+
+typedef struct {
+    const char *name;
+    const char *args;
+} dims_parsed_command_rec;
+
+typedef struct {
+    apr_size_t count;
+    dims_parsed_command_rec *commands;
+} dims_parsed_commands_rec;
+
+typedef struct {
+    const char *key;
+    dims_parsed_commands_rec parsed_commands;
+} dims_op_cache_entry_rec;
+
+typedef struct {
+    apr_hash_t *map;
+    apr_array_header_t *fifo_keys;
+    apr_thread_mutex_t *mutex;
+    apr_uint32_t max_entries;
+} dims_op_cache_rec;
 
 typedef struct {
     dims_request_rec *d;
@@ -90,11 +119,23 @@ typedef struct {
     apr_uint32_t failure_count;
     apr_uint32_t download_timeout_count;
     apr_uint32_t imagemagick_timeout_count;
+    apr_uint32_t fetch_samples_count;
+    apr_uint32_t im_samples_count;
+    apr_uint32_t fetch_time_buckets[DIMS_LATENCY_BUCKET_COUNT];
+    apr_uint32_t im_time_buckets[DIMS_LATENCY_BUCKET_COUNT];
+    apr_uint32_t op_cache_hit_count;
+    apr_uint32_t op_cache_miss_count;
+    apr_uint32_t fetch_total_count;
+    apr_uint32_t fetch_reused_handle_count;
 } dims_stats_rec;
 
 dims_stats_rec *stats;
 apr_shm_t *shm;
 apr_hash_t *ops;
+
+static const long dims_latency_bucket_bounds_ms[DIMS_LATENCY_BUCKET_BOUND_COUNT] = {
+    5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000
+};
 
 static int
 dims_parse_long_value(const char *arg, long min_value, long max_value, long *result)
@@ -429,6 +470,229 @@ dims_parse_query_params(apr_pool_t *pool, const char *query)
     return params;
 }
 
+static int
+dims_latency_bucket_index(long elapsed_ms)
+{
+    int i;
+
+    for (i = 0; i < DIMS_LATENCY_BUCKET_BOUND_COUNT; i++) {
+        if (elapsed_ms <= dims_latency_bucket_bounds_ms[i]) {
+            return i;
+        }
+    }
+
+    return DIMS_LATENCY_BUCKET_COUNT - 1;
+}
+
+static void
+dims_record_latency_sample(volatile apr_uint32_t *histogram,
+                           volatile apr_uint32_t *sample_count,
+                           long elapsed_ms)
+{
+    int bucket;
+
+    if (histogram == NULL || sample_count == NULL || elapsed_ms < 0) {
+        return;
+    }
+
+    bucket = dims_latency_bucket_index(elapsed_ms);
+    apr_atomic_inc32((apr_uint32_t *) &histogram[bucket]);
+    apr_atomic_inc32((apr_uint32_t *) sample_count);
+}
+
+static long
+dims_latency_percentile_from_hist(const volatile apr_uint32_t *histogram,
+                                  apr_uint32_t total,
+                                  int percentile)
+{
+    apr_uint32_t target;
+    apr_uint32_t seen = 0;
+    int i;
+
+    if (histogram == NULL || total == 0 || percentile <= 0) {
+        return 0;
+    }
+
+    if (percentile > 100) {
+        percentile = 100;
+    }
+
+    target = (apr_uint32_t) ((((apr_uint64_t) total) * (apr_uint64_t) percentile + 99) / 100);
+    if (target == 0) {
+        target = 1;
+    }
+
+    for (i = 0; i < DIMS_LATENCY_BUCKET_COUNT; i++) {
+        seen += apr_atomic_read32((apr_uint32_t *) &histogram[i]);
+        if (seen >= target) {
+            if (i < DIMS_LATENCY_BUCKET_BOUND_COUNT) {
+                return dims_latency_bucket_bounds_ms[i];
+            }
+            return dims_latency_bucket_bounds_ms[DIMS_LATENCY_BUCKET_BOUND_COUNT - 1];
+        }
+    }
+
+    return dims_latency_bucket_bounds_ms[DIMS_LATENCY_BUCKET_BOUND_COUNT - 1];
+}
+
+static int
+dims_parse_commands_into_pool(apr_pool_t *pool,
+                              const char *command_string,
+                              dims_parsed_commands_rec *out)
+{
+    const char *commands_copy;
+    const char *cursor;
+    const char *end;
+    apr_array_header_t *parsed;
+
+    if (pool == NULL || out == NULL) {
+        return 0;
+    }
+
+    out->count = 0;
+    out->commands = NULL;
+
+    if (command_string == NULL || *command_string == '\0') {
+        return 1;
+    }
+
+    commands_copy = apr_pstrdup(pool, command_string);
+    cursor = commands_copy;
+    end = commands_copy + strlen(commands_copy);
+    parsed = apr_array_make(pool, 8, sizeof(dims_parsed_command_rec));
+    if (parsed == NULL) {
+        return 0;
+    }
+
+    while (cursor < end) {
+        char *name = ap_getword(pool, &cursor, '/');
+        char *args = "";
+        dims_parsed_command_rec *slot;
+
+        if (name == NULL) {
+            break;
+        }
+
+        if (*name == '\0') {
+            continue;
+        }
+
+        if (cursor < end) {
+            args = ap_getword(pool, &cursor, '/');
+        }
+
+        slot = apr_array_push(parsed);
+        slot->name = apr_pstrdup(pool, name);
+        slot->args = apr_pstrdup(pool, args ? args : "");
+    }
+
+    out->count = parsed->nelts;
+    out->commands = (dims_parsed_command_rec *) parsed->elts;
+
+    return 1;
+}
+
+static dims_op_cache_rec *
+dims_get_op_cache(server_rec *s)
+{
+    void *userdata = NULL;
+
+    if (s == NULL) {
+        return NULL;
+    }
+
+    apr_pool_userdata_get((void *) &userdata, DIMS_OP_CACHE_KEY, s->process->pool);
+    return (dims_op_cache_rec *) userdata;
+}
+
+static const dims_parsed_commands_rec *
+dims_get_parsed_commands_for_request(dims_request_rec *d)
+{
+    dims_parsed_commands_rec *uncached;
+    dims_op_cache_rec *cache;
+    dims_op_cache_entry_rec *entry = NULL;
+    apr_pool_t *process_pool;
+
+    if (d == NULL || d->unparsed_commands == NULL) {
+        return NULL;
+    }
+
+    if (d->parsed_commands_cache_ref != NULL) {
+        return (const dims_parsed_commands_rec *) d->parsed_commands_cache_ref;
+    }
+
+    if (!d->config->enable_op_cache) {
+        uncached = apr_pcalloc(d->pool, sizeof(*uncached));
+        if (!dims_parse_commands_into_pool(d->pool, d->unparsed_commands, uncached)) {
+            return NULL;
+        }
+        d->parsed_commands_cache_ref = uncached;
+        return uncached;
+    }
+
+    cache = dims_get_op_cache(d->r->server);
+    if (cache == NULL || cache->mutex == NULL || cache->map == NULL) {
+        uncached = apr_pcalloc(d->pool, sizeof(*uncached));
+        if (!dims_parse_commands_into_pool(d->pool, d->unparsed_commands, uncached)) {
+            return NULL;
+        }
+        d->parsed_commands_cache_ref = uncached;
+        return uncached;
+    }
+
+    apr_thread_mutex_lock(cache->mutex);
+    entry = apr_hash_get(cache->map, d->unparsed_commands, APR_HASH_KEY_STRING);
+    if (entry != NULL) {
+        apr_thread_mutex_unlock(cache->mutex);
+        apr_atomic_inc32(&stats->op_cache_hit_count);
+        d->parsed_commands_cache_ref = (void *) &entry->parsed_commands;
+        return (const dims_parsed_commands_rec *) d->parsed_commands_cache_ref;
+    }
+    apr_thread_mutex_unlock(cache->mutex);
+
+    apr_thread_mutex_lock(cache->mutex);
+    entry = apr_hash_get(cache->map, d->unparsed_commands, APR_HASH_KEY_STRING);
+    if (entry == NULL) {
+        const char *evicted_key = NULL;
+        const char *new_key;
+        int fifo_size;
+        process_pool = d->r->server->process->pool;
+
+        entry = apr_pcalloc(process_pool, sizeof(*entry));
+        if (entry == NULL ||
+            !dims_parse_commands_into_pool(process_pool, d->unparsed_commands, &entry->parsed_commands)) {
+            apr_thread_mutex_unlock(cache->mutex);
+            return NULL;
+        }
+
+        new_key = apr_pstrdup(process_pool, d->unparsed_commands);
+        entry->key = new_key;
+
+        if (cache->max_entries == 0) {
+            cache->max_entries = DIMS_DEFAULT_OP_CACHE_SIZE;
+        }
+
+        fifo_size = cache->fifo_keys->nelts;
+        if ((apr_uint32_t) fifo_size >= cache->max_entries && fifo_size > 0) {
+            const char **keys = (const char **) cache->fifo_keys->elts;
+            evicted_key = keys[0];
+            memmove(keys, keys + 1, sizeof(const char *) * (fifo_size - 1));
+            cache->fifo_keys->nelts = fifo_size - 1;
+            apr_hash_set(cache->map, evicted_key, APR_HASH_KEY_STRING, NULL);
+        }
+
+        *(const char **) apr_array_push(cache->fifo_keys) = entry->key;
+        apr_hash_set(cache->map, entry->key, APR_HASH_KEY_STRING, entry);
+        apr_atomic_inc32(&stats->op_cache_miss_count);
+    } else {
+        apr_atomic_inc32(&stats->op_cache_hit_count);
+    }
+    apr_thread_mutex_unlock(cache->mutex);
+
+    d->parsed_commands_cache_ref = (void *) &entry->parsed_commands;
+    return (const dims_parsed_commands_rec *) d->parsed_commands_cache_ref;
+}
+
 static void *
 dims_create_config(apr_pool_t *p, server_rec *s)
 {
@@ -458,6 +722,11 @@ dims_create_config(apr_pool_t *p, server_rec *s)
     config->log_sensitive_data = 0;
     config->allow_legacy_ecb = 0;
     config->default_output_format = NULL;
+    config->status_extended = 0;
+    config->enable_op_cache = 1;
+    config->op_cache_size = DIMS_DEFAULT_OP_CACHE_SIZE;
+    config->fetch_connection_reuse = 1;
+    config->max_concurrent_fetches_per_child = DIMS_DEFAULT_MAX_CONCURRENT_FETCHES_PER_CHILD;
 
     config->area_size = 128 * 1024 * 1024;         //  128mb max.
     config->memory_size = 512 * 1024 * 1024;       //  512mb max.
@@ -789,6 +1058,81 @@ dims_config_set_default_output_format(cmd_parms *cmd, void *dummy, const char *a
     char *s = output_format;
     while (*s) { *s = toupper(*s); s++; }
     config->default_output_format = output_format;
+    return NULL;
+}
+
+static const char *
+dims_config_set_status_extended(cmd_parms *cmd, void *dummy, const char *arg)
+{
+    dims_config_rec *config = (dims_config_rec *) ap_get_module_config(
+            cmd->server->module_config, &dims_module);
+    int value = 0;
+
+    if (!dims_parse_bool_value(arg, &value)) {
+        return "DimsStatusExtended must be true/false.";
+    }
+
+    config->status_extended = value;
+    return NULL;
+}
+
+static const char *
+dims_config_set_enable_op_cache(cmd_parms *cmd, void *dummy, const char *arg)
+{
+    dims_config_rec *config = (dims_config_rec *) ap_get_module_config(
+            cmd->server->module_config, &dims_module);
+    int value = 0;
+
+    if (!dims_parse_bool_value(arg, &value)) {
+        return "DimsEnableOpCache must be true/false.";
+    }
+
+    config->enable_op_cache = value;
+    return NULL;
+}
+
+static const char *
+dims_config_set_op_cache_size(cmd_parms *cmd, void *dummy, const char *arg)
+{
+    dims_config_rec *config = (dims_config_rec *) ap_get_module_config(
+            cmd->server->module_config, &dims_module);
+    long value = 0;
+
+    if (!dims_parse_long_value(arg, 1, LONG_MAX, &value)) {
+        return "DimsOpCacheSize must be a positive integer.";
+    }
+
+    config->op_cache_size = value;
+    return NULL;
+}
+
+static const char *
+dims_config_set_fetch_connection_reuse(cmd_parms *cmd, void *dummy, const char *arg)
+{
+    dims_config_rec *config = (dims_config_rec *) ap_get_module_config(
+            cmd->server->module_config, &dims_module);
+    int value = 0;
+
+    if (!dims_parse_bool_value(arg, &value)) {
+        return "DimsFetchConnectionReuse must be true/false.";
+    }
+
+    config->fetch_connection_reuse = value;
+    return NULL;
+}
+
+static const char *
+dims_config_set_max_concurrent_fetches_per_child(cmd_parms *cmd, void *dummy, const char *arg)
+{
+    dims_config_rec *config = (dims_config_rec *) ap_get_module_config(
+            cmd->server->module_config, &dims_module);
+    long value = 0;
+
+    if (!dims_parse_long_value(arg, 1, LONG_MAX, &value)) {
+        return "DimsMaxConcurrentFetchesPerChild must be a positive integer.";
+    }
+
+    config->max_concurrent_fetches_per_child = value;
     return NULL;
 }
 
@@ -1249,6 +1593,8 @@ dims_get_image_data(dims_request_rec *d, char *fetch_url, dims_image_data_t *dat
     dims_image_data_t image_data;
     int extra_time = 0;
     char *encoded_fetch_url = NULL;
+    dims_curl_rec *locks = NULL;
+    int acquired_fetch_slot = 0;
 
     /* Allow for some extra time to download the NOIMAGE image. */
     void *s = NULL;
@@ -1265,6 +1611,26 @@ dims_get_image_data(dims_request_rec *d, char *fetch_url, dims_image_data_t *dat
 
     apr_pool_userdata_get((void *) &s, DIMS_CURL_SHARED_KEY,
             d->r->server->process->pool);
+    if (s) {
+        locks = (dims_curl_rec *) s;
+    }
+
+    apr_atomic_inc32(&stats->fetch_total_count);
+
+    if (locks != NULL && d->config->max_concurrent_fetches_per_child > 0) {
+        while (1) {
+            apr_uint32_t current_fetches = apr_atomic_read32(&locks->active_fetches);
+            if (current_fetches >= (apr_uint32_t) d->config->max_concurrent_fetches_per_child) {
+                result_code = CURLE_AGAIN;
+                goto cleanup;
+            }
+
+            if (apr_atomic_cas32(&locks->active_fetches, current_fetches + 1, current_fetches) == current_fetches) {
+                acquired_fetch_slot = 1;
+                break;
+            }
+        }
+    }
 
     /* Encode the fetch URL before downloading */
     if (!d->config->disable_encoded_fetch) {
@@ -1285,7 +1651,18 @@ dims_get_image_data(dims_request_rec *d, char *fetch_url, dims_image_data_t *dat
         goto cleanup;
     }
 
-    curl_handle = curl_easy_init();
+    if (locks != NULL && d->config->fetch_connection_reuse && locks->easy_queue != NULL) {
+        void *queue_item = NULL;
+        if (apr_queue_trypop(locks->easy_queue, &queue_item) == APR_SUCCESS && queue_item != NULL) {
+            curl_handle = (CURL *) queue_item;
+            curl_easy_reset(curl_handle);
+            apr_atomic_inc32(&stats->fetch_reused_handle_count);
+        }
+    }
+
+    if (curl_handle == NULL) {
+        curl_handle = curl_easy_init();
+    }
     if (curl_handle == NULL) {
         result_code = CURLE_FAILED_INIT;
         goto cleanup;
@@ -1296,11 +1673,11 @@ dims_get_image_data(dims_request_rec *d, char *fetch_url, dims_image_data_t *dat
     curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *) &image_data);
     curl_easy_setopt(curl_handle, CURLOPT_HEADERFUNCTION, dims_write_header_cb);
     curl_easy_setopt(curl_handle, CURLOPT_HEADERDATA, (void *) d);
-    curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT_MS, d->config->download_timeout + extra_time);
-    curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT_MS, d->config->connect_timeout);
-    curl_easy_setopt(curl_handle, CURLOPT_NOSIGNAL, 1);
-    curl_easy_setopt(curl_handle, CURLOPT_FOLLOWLOCATION, 1);
-    curl_easy_setopt(curl_handle, CURLOPT_MAXREDIRS, d->config->max_redirects);
+    curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT_MS, (long) (d->config->download_timeout + extra_time));
+    curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT_MS, (long) d->config->connect_timeout);
+    curl_easy_setopt(curl_handle, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl_handle, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl_handle, CURLOPT_MAXREDIRS, (long) d->config->max_redirects);
     curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYHOST, 2L);
     curl_easy_setopt(curl_handle, CURLOPT_VERBOSE, 0L);
@@ -1323,8 +1700,7 @@ dims_get_image_data(dims_request_rec *d, char *fetch_url, dims_image_data_t *dat
     /* The curl shared handle allows this process to share DNS cache
      * and prevents the DNS cache from going away after every request.
      */
-    if (s) {
-        dims_curl_rec *locks = (dims_curl_rec *) s;
+    if (locks != NULL) {
         curl_easy_setopt(curl_handle, CURLOPT_SHARE, locks->share);
     }
 
@@ -1345,7 +1721,18 @@ cleanup:
     *data = image_data;
 
     if (curl_handle != NULL) {
-        curl_easy_cleanup(curl_handle);
+        if (locks != NULL && d->config->fetch_connection_reuse && locks->easy_queue != NULL) {
+            curl_easy_reset(curl_handle);
+            if (apr_queue_trypush(locks->easy_queue, curl_handle) != APR_SUCCESS) {
+                curl_easy_cleanup(curl_handle);
+            }
+        } else {
+            curl_easy_cleanup(curl_handle);
+        }
+    }
+
+    if (acquired_fetch_slot && locks != NULL) {
+        apr_atomic_dec32(&locks->active_fetches);
     }
 
     if (encoded_fetch_url != NULL) {
@@ -1411,7 +1798,11 @@ dims_fetch_remote_image(dims_request_rec *d, const char *url)
                 free(image_data.data);
             }
 
-            if (image_data.too_large && d->config->max_download_bytes > 0) {
+            if (code == CURLE_AGAIN) {
+                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, d->r,
+                        "mod_dims error, 'Exceeded DimsMaxConcurrentFetchesPerChild (%ld)', on request: %s",
+                        d->config->max_concurrent_fetches_per_child, d->r->uri);
+            } else if (image_data.too_large && d->config->max_download_bytes > 0) {
                 ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, d->r,
                         "mod_dims error, 'Downloaded image exceeds DimsMaxDownloadBytes (%ld bytes)', on request: %s",
                         d->config->max_download_bytes, d->r->uri);
@@ -1425,6 +1816,8 @@ dims_fetch_remote_image(dims_request_rec *d, const char *url)
             d->fetch_http_status = 500;
             if(code == CURLE_OPERATION_TIMEDOUT) {
                 d->status = DIMS_DOWNLOAD_TIMEOUT;
+            } else if (code == CURLE_AGAIN) {
+                d->fetch_http_status = 503;
             }
 
             d->download_time = (apr_time_now() - start_time) / 1000;
@@ -1698,6 +2091,13 @@ dims_send_image(dims_request_rec *d)
         apr_atomic_inc32(&stats->imagemagick_timeout_count);
     }
 
+    if (d->download_time >= 0) {
+        dims_record_latency_sample(stats->fetch_time_buckets, &stats->fetch_samples_count, d->download_time);
+    }
+    if (d->imagemagick_time >= 0) {
+        dims_record_latency_sample(stats->im_time_buckets, &stats->im_samples_count, d->imagemagick_time);
+    }
+
     /* Record metrics for logging. */
     snprintf(buf, 128, "%d", d->status);
     apr_table_set(d->r->notes, "DIMS_STATUS", buf);
@@ -1780,31 +2180,30 @@ dims_cleanup(dims_request_rec *d, char *err_msg, int status)
 static void
 dims_set_optimal_geometry(dims_request_rec *d)
 {
+    const dims_parsed_commands_rec *parsed_commands;
     MagickStatusType flags;
     RectangleInfo rec;
-    const char *cmds = d->unparsed_commands;
+    apr_size_t i;
 
     if(!d->wand) {
         d->wand = NewMagickWand();
     }
 
-    /* Process operations. */
-    while(cmds < d->unparsed_commands + strlen(d->unparsed_commands)) {
-        char *command = ap_getword(d->pool, &cmds, '/');
+    parsed_commands = dims_get_parsed_commands_for_request(d);
+    if (parsed_commands == NULL) {
+        return;
+    }
 
-        if(strcmp(command, "resize") == 0 ||
-            strcmp(command, "legacy_thumbnail") == 0 ||
-            strcmp(command, "thumbnail") == 0) {
-            char *args = ap_getword(d->pool, &cmds, '/');
+    for (i = 0; i < parsed_commands->count; i++) {
+        const dims_parsed_command_rec *command = &parsed_commands->commands[i];
 
-            flags = ParseAbsoluteGeometry(args, &rec);
+        if(strcmp(command->name, "resize") == 0 ||
+           strcmp(command->name, "legacy_thumbnail") == 0 ||
+           strcmp(command->name, "thumbnail") == 0) {
+            flags = ParseAbsoluteGeometry(command->args, &rec);
             if(flags & WidthValue && flags & HeightValue && !(flags & PercentValue)) {
                 MagickSetSize(d->wand, rec.width, rec.height);
                 return;
-            }
-        } else {
-            if(strcmp(command, "") != 0) {
-                ap_getword(d->pool, &cmds, '/');
             }
         }
     }
@@ -1829,6 +2228,8 @@ static apr_status_t
 dims_process_image(dims_request_rec *d) 
 {
     apr_time_t start_time = apr_time_now();
+    const dims_parsed_commands_rec *parsed_commands;
+    apr_size_t i;
 
     /* Hook in the progress monitor.  It gets passed a 
      * dims_progress_rec which keeps track of the start time.
@@ -1865,16 +2266,18 @@ dims_process_image(dims_request_rec *d)
      */
     MagickAutoOrientImage(d->wand);
 
+    parsed_commands = dims_get_parsed_commands_for_request(d);
+    if (parsed_commands == NULL) {
+        return dims_cleanup(d, "Failed to parse image operations", DIMS_BAD_ARGUMENTS);
+    }
+
     /* Flatten images (i.e animated gif) if there's an overlay or file type is `psd`. Otherwise, pass through. */
     size_t images = MagickGetNumberImages(d->wand);
     bool should_flatten = false;
 
     if (images > 1) {
-        const char *cmds = d->unparsed_commands;
-        while(cmds < d->unparsed_commands + strlen(d->unparsed_commands)) {
-            char *command = ap_getword(d->pool, &cmds, '/');
-
-            if (strcmp(command, "watermark") == 0) {
+        for (i = 0; i < parsed_commands->count; i++) {
+            if (strcmp(parsed_commands->commands[i].name, "watermark") == 0) {
                 should_flatten = true;
                 break;
             }
@@ -1896,65 +2299,63 @@ dims_process_image(dims_request_rec *d)
 
     if (images == 1 || should_flatten) {
         bool output_format_provided = false;
-        const char *cmds = d->unparsed_commands;
-        while(cmds < d->unparsed_commands + strlen(d->unparsed_commands)) {
-            char *command = ap_getword(d->pool, &cmds, '/');
+        for (i = 0; i < parsed_commands->count; i++) {
+            const dims_parsed_command_rec *parsed = &parsed_commands->commands[i];
+            const char *command = parsed->name;
+            char *args = apr_pstrdup(d->pool, parsed->args);
+            const char *command_to_run = command;
 
-            if (strcmp(command, "format") == 0) {
+            if (strcmp(command_to_run, "format") == 0) {
                 output_format_provided = true;
             }
-    
-            if(strlen(command) > 0) {
-                char *args = ap_getword(d->pool, &cmds, '/');
 
-                /* If the NOIMAGE image is being used for some reason then
-                * we don't want to crop it.
-                */
-                if(d->use_no_image && 
-                        (strcmp(command, "crop") == 0 ||
-                        strcmp(command, "legacy_thumbnail") == 0 ||
-                        strcmp(command, "legacy_crop") == 0 ||
-                        strcmp(command, "thumbnail") == 0)) {
-                    MagickStatusType flags;
-                    RectangleInfo rec;
+            /* If the NOIMAGE image is being used for some reason then
+             * we don't want to crop it.
+             */
+            if(d->use_no_image &&
+                    (strcmp(command_to_run, "crop") == 0 ||
+                    strcmp(command_to_run, "legacy_thumbnail") == 0 ||
+                    strcmp(command_to_run, "legacy_crop") == 0 ||
+                    strcmp(command_to_run, "thumbnail") == 0)) {
+                MagickStatusType flags;
+                RectangleInfo rec;
 
-                    flags = ParseAbsoluteGeometry(args, &rec);
+                flags = ParseAbsoluteGeometry(args, &rec);
 
-                    if(rec.width > 0 && rec.height == 0) {
-                        args = apr_psprintf(d->pool, "%ld", rec.width);
-                    } else if(rec.height > 0 && rec.width == 0) {
-                        args = apr_psprintf(d->pool, "x%ld", rec.height);
-                    } else if(rec.width > 0 && rec.height > 0) {
-                        args = apr_psprintf(d->pool, "%ldx%ld", rec.width, rec.height);
-                    } else {
-                        return dims_cleanup(d, NULL, DIMS_BAD_ARGUMENTS);
-                    }
-
-                    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, d->r, 
-                        "Rewriting command %s to 'resize' because a NOIMAGE "
-                        "image is being processed.", command);
-
-                    command = "resize"; 
+                if(rec.width > 0 && rec.height == 0) {
+                    args = apr_psprintf(d->pool, "%ld", rec.width);
+                } else if(rec.height > 0 && rec.width == 0) {
+                    args = apr_psprintf(d->pool, "x%ld", rec.height);
+                } else if(rec.width > 0 && rec.height > 0) {
+                    args = apr_psprintf(d->pool, "%ldx%ld", rec.width, rec.height);
+                } else {
+                    return dims_cleanup(d, NULL, DIMS_BAD_ARGUMENTS);
                 }
 
-                // Check if the command is present and set flag.
-                if(strcmp(command, "strip") == 0) {
-                    exc_strip_cmd = 1;
-                }
+                ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, d->r,
+                    "Rewriting command %s to 'resize' because a NOIMAGE "
+                    "image is being processed.", command_to_run);
 
-                dims_operation_func *func =
-                        apr_hash_get(ops, command, APR_HASH_KEY_STRING);
-                if(func != NULL) {
-                    char *err = NULL;
-                    apr_status_t code;
+                command_to_run = "resize";
+            }
 
-                    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, d->r, 
-                        "Executing command %s(%s), on request %s", 
-                        command, args, d->r->uri);
+            // Check if the command is present and set flag.
+            if(strcmp(command_to_run, "strip") == 0) {
+                exc_strip_cmd = 1;
+            }
 
-                    if((code = func(d, args, &err)) != DIMS_SUCCESS) {
-                        return dims_cleanup(d, err, code); 
-                    }
+            dims_operation_func *func =
+                    apr_hash_get(ops, command_to_run, APR_HASH_KEY_STRING);
+            if(func != NULL) {
+                char *err = NULL;
+                apr_status_t code;
+
+                ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, d->r,
+                    "Executing command %s(%s), on request %s",
+                    command_to_run, args, d->r->uri);
+
+                if((code = func(d, args, &err)) != DIMS_SUCCESS) {
+                    return dims_cleanup(d, err, code);
                 }
             }
 
@@ -2507,6 +2908,7 @@ dims_handler(request_rec *r)
     d->optimize_resize = d->config->optimize_resize;
     d->send_content_disposition = 0;
     d->content_disposition_filename = NULL;
+    d->parsed_commands_cache_ref = NULL;
 
     /* Set initial notes to be logged by mod_log_config. */
     apr_table_setn(r->notes, "DIMS_STATUS", "0");
@@ -2768,6 +3170,8 @@ dims_handler(request_rec *r)
         return dims_handle_request(d);
     } else if(strcmp(r->handler, "dims-status") == 0) {
         apr_time_t uptime;
+        dims_curl_rec *locks = NULL;
+        void *userdata = NULL;
 
         ap_set_content_type(r, "text/plain");
         ap_rvputs(r, "ALIVE\n\n", NULL);
@@ -2793,6 +3197,11 @@ dims_handler(request_rec *r)
         ap_rprintf(r, "Allowed fetch schemes: %s\n", d->config->allowed_fetch_schemes);
         ap_rprintf(r, "Log sensitive data: %s\n", d->config->log_sensitive_data ? "true" : "false");
         ap_rprintf(r, "Allow legacy ECB: %s\n", d->config->allow_legacy_ecb ? "true" : "false");
+        ap_rprintf(r, "Status extended: %s\n", d->config->status_extended ? "true" : "false");
+        ap_rprintf(r, "Enable op cache: %s\n", d->config->enable_op_cache ? "true" : "false");
+        ap_rprintf(r, "Op cache size: %ld\n", d->config->op_cache_size);
+        ap_rprintf(r, "Fetch connection reuse: %s\n", d->config->fetch_connection_reuse ? "true" : "false");
+        ap_rprintf(r, "Max concurrent fetches per child: %ld\n", d->config->max_concurrent_fetches_per_child);
 
         ap_rprintf(r, "\nDetails\n-------\n");
         
@@ -2804,6 +3213,47 @@ dims_handler(request_rec *r)
                 apr_atomic_read32(&stats->download_timeout_count));
         ap_rprintf(r, "Imagemagick Timeouts: %d\n", 
                 apr_atomic_read32(&stats->imagemagick_timeout_count));
+
+        apr_pool_userdata_get((void *) &userdata, DIMS_CURL_SHARED_KEY, r->server->process->pool);
+        if (userdata != NULL) {
+            locks = (dims_curl_rec *) userdata;
+            ap_rprintf(r, "Active fetches in child: %u\n",
+                    apr_atomic_read32(&locks->active_fetches));
+        }
+
+        if (d->config->status_extended) {
+            apr_uint32_t fetch_samples = apr_atomic_read32(&stats->fetch_samples_count);
+            apr_uint32_t im_samples = apr_atomic_read32(&stats->im_samples_count);
+            apr_uint32_t cache_hits = apr_atomic_read32(&stats->op_cache_hit_count);
+            apr_uint32_t cache_misses = apr_atomic_read32(&stats->op_cache_miss_count);
+            apr_uint32_t fetch_total = apr_atomic_read32(&stats->fetch_total_count);
+            apr_uint32_t fetch_reused = apr_atomic_read32(&stats->fetch_reused_handle_count);
+            double op_cache_hit_ratio = 0.0;
+            double fetch_reuse_ratio = 0.0;
+
+            if (cache_hits + cache_misses > 0) {
+                op_cache_hit_ratio = ((double) cache_hits) / ((double) (cache_hits + cache_misses));
+            }
+            if (fetch_total > 0) {
+                fetch_reuse_ratio = ((double) fetch_reused) / ((double) fetch_total);
+            }
+
+            ap_rprintf(r, "\nExtended Metrics\n----------------\n");
+            ap_rprintf(r, "Fetch samples: %u\n", fetch_samples);
+            ap_rprintf(r, "Fetch time ms P50/P95/P99: %ld/%ld/%ld\n",
+                    dims_latency_percentile_from_hist(stats->fetch_time_buckets, fetch_samples, 50),
+                    dims_latency_percentile_from_hist(stats->fetch_time_buckets, fetch_samples, 95),
+                    dims_latency_percentile_from_hist(stats->fetch_time_buckets, fetch_samples, 99));
+            ap_rprintf(r, "Imagemagick samples: %u\n", im_samples);
+            ap_rprintf(r, "Imagemagick time ms P50/P95/P99: %ld/%ld/%ld\n",
+                    dims_latency_percentile_from_hist(stats->im_time_buckets, im_samples, 50),
+                    dims_latency_percentile_from_hist(stats->im_time_buckets, im_samples, 95),
+                    dims_latency_percentile_from_hist(stats->im_time_buckets, im_samples, 99));
+            ap_rprintf(r, "Op cache hit ratio: %.4f (%u hits, %u misses)\n",
+                    op_cache_hit_ratio, cache_hits, cache_misses);
+            ap_rprintf(r, "Fetch connection reuse ratio: %.4f (%u reused of %u fetches)\n",
+                    fetch_reuse_ratio, fetch_reused, fetch_total);
+        }
 
         ap_rflush(r);
         return OK;
@@ -2911,10 +3361,16 @@ dims_init(apr_pool_t *p, apr_pool_t *plog, apr_pool_t* ptemp, server_rec *s)
         return HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    stats->success_count = 1;
+    stats->success_count = 0;
     stats->failure_count = 0;
     stats->download_timeout_count = 0;
     stats->imagemagick_timeout_count = 0;
+    stats->fetch_samples_count = 0;
+    stats->im_samples_count = 0;
+    stats->op_cache_hit_count = 0;
+    stats->op_cache_miss_count = 0;
+    stats->fetch_total_count = 0;
+    stats->fetch_reused_handle_count = 0;
 
     return OK;
 }
@@ -2951,15 +3407,38 @@ static apr_status_t
 dims_child_cleanup(void *data)
 {
     dims_curl_rec *locks = (dims_curl_rec *) data;
+    void *handle = NULL;
 
-    curl_share_cleanup(locks->share);
+    if (locks == NULL) {
+        return APR_SUCCESS;
+    }
+
+    if (locks->easy_queue != NULL) {
+        while (apr_queue_trypop(locks->easy_queue, &handle) == APR_SUCCESS) {
+            if (handle != NULL) {
+                curl_easy_cleanup((CURL *) handle);
+            }
+        }
+    }
+
+    if (locks->share != NULL) {
+        curl_share_cleanup(locks->share);
+    }
     curl_global_cleanup();
 
-    apr_thread_mutex_destroy(locks->share_mutex);
-    apr_thread_mutex_destroy(locks->dns_mutex);
+    if (locks->share_mutex != NULL) {
+        apr_thread_mutex_destroy(locks->share_mutex);
+    }
+    if (locks->dns_mutex != NULL) {
+        apr_thread_mutex_destroy(locks->dns_mutex);
+    }
 
-    apr_pool_userdata_set(NULL, DIMS_CURL_SHARED_KEY, NULL,
-            locks->s->process->pool);
+    if (locks->s != NULL && locks->s->process != NULL && locks->s->process->pool != NULL) {
+        apr_pool_userdata_set(NULL, DIMS_CURL_SHARED_KEY, NULL,
+                locks->s->process->pool);
+        apr_pool_userdata_set(NULL, DIMS_OP_CACHE_KEY, NULL,
+                locks->s->process->pool);
+    }
 
     MagickWandTerminus();
 
@@ -2969,34 +3448,153 @@ dims_child_cleanup(void *data)
 static void
 dims_child_init(apr_pool_t *p, server_rec *s)
 {
-    MagickWandGenesis();
-    curl_global_init(CURL_GLOBAL_ALL);
+    dims_config_rec *config = (dims_config_rec *)
+            ap_get_module_config(s->module_config, &dims_module);
+    dims_op_cache_rec *op_cache = NULL;
+    dims_curl_rec *locks = NULL;
+    apr_status_t status;
+    CURLSHcode share_status;
+    int magick_initialized = 0;
+    int curl_initialized = 0;
 
-    dims_curl_rec *locks =
-            (dims_curl_rec *) apr_pcalloc(p, sizeof(dims_curl_rec));
+    MagickWandGenesis();
+    magick_initialized = 1;
+    if (curl_global_init(CURL_GLOBAL_ALL) != CURLE_OK) {
+        ap_log_error(APLOG_MARK, APLOG_ERR, 0, s,
+                     "mod_dims: curl_global_init failed in child init");
+        goto fail;
+    }
+    curl_initialized = 1;
+
+    locks = (dims_curl_rec *) apr_pcalloc(p, sizeof(dims_curl_rec));
+    if (locks == NULL) {
+        ap_log_error(APLOG_MARK, APLOG_ERR, 0, s,
+                     "mod_dims: unable to allocate child curl state");
+        goto fail;
+    }
 
     locks->s = s;
-    locks->share = curl_share_init(); 
+    locks->share = curl_share_init();
+    if (locks->share == NULL) {
+        ap_log_error(APLOG_MARK, APLOG_ERR, 0, s,
+                     "mod_dims: curl_share_init failed in child init");
+        goto fail;
+    }
 
-    apr_thread_mutex_create(&locks->share_mutex, APR_THREAD_MUTEX_DEFAULT, p);
-    apr_thread_mutex_create(&locks->dns_mutex, APR_THREAD_MUTEX_DEFAULT, p);
+    status = apr_thread_mutex_create(&locks->share_mutex, APR_THREAD_MUTEX_DEFAULT, p);
+    if (status != APR_SUCCESS) {
+        ap_log_error(APLOG_MARK, APLOG_ERR, status, s,
+                     "mod_dims: failed to create curl share mutex");
+        goto fail;
+    }
+    status = apr_thread_mutex_create(&locks->dns_mutex, APR_THREAD_MUTEX_DEFAULT, p);
+    if (status != APR_SUCCESS) {
+        ap_log_error(APLOG_MARK, APLOG_ERR, status, s,
+                     "mod_dims: failed to create curl dns mutex");
+        goto fail;
+    }
 
-    curl_share_setopt(locks->share, CURLSHOPT_LOCKFUNC, lock_share); 
-    curl_share_setopt(locks->share, CURLSHOPT_UNLOCKFUNC, unlock_share); 
-    curl_share_setopt(locks->share, CURLSHOPT_USERDATA, (void *) locks); 
-    curl_share_setopt(locks->share, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
+    share_status = curl_share_setopt(locks->share, CURLSHOPT_LOCKFUNC, lock_share);
+    if (share_status != CURLSHE_OK) {
+        ap_log_error(APLOG_MARK, APLOG_ERR, 0, s,
+                     "mod_dims: curl_share_setopt LOCKFUNC failed (%d)", (int) share_status);
+        goto fail;
+    }
+    share_status = curl_share_setopt(locks->share, CURLSHOPT_UNLOCKFUNC, unlock_share);
+    if (share_status != CURLSHE_OK) {
+        ap_log_error(APLOG_MARK, APLOG_ERR, 0, s,
+                     "mod_dims: curl_share_setopt UNLOCKFUNC failed (%d)", (int) share_status);
+        goto fail;
+    }
+    share_status = curl_share_setopt(locks->share, CURLSHOPT_USERDATA, (void *) locks);
+    if (share_status != CURLSHE_OK) {
+        ap_log_error(APLOG_MARK, APLOG_ERR, 0, s,
+                     "mod_dims: curl_share_setopt USERDATA failed (%d)", (int) share_status);
+        goto fail;
+    }
+    share_status = curl_share_setopt(locks->share, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
+    if (share_status != CURLSHE_OK) {
+        ap_log_error(APLOG_MARK, APLOG_ERR, 0, s,
+                     "mod_dims: curl_share_setopt SHARE DNS failed (%d)", (int) share_status);
+        goto fail;
+    }
+    locks->active_fetches = 0;
+
+    if (config->fetch_connection_reuse) {
+        apr_uint32_t queue_size = (config->curl_queue_size > 0) ?
+            (apr_uint32_t) config->curl_queue_size : 10;
+        status = apr_queue_create(&locks->easy_queue, queue_size, p);
+        if (status != APR_SUCCESS) {
+            ap_log_error(APLOG_MARK, APLOG_WARNING, status, s,
+                         "mod_dims: failed to create curl easy-handle queue; disabling reuse");
+            locks->easy_queue = NULL;
+        }
+    } else {
+        locks->easy_queue = NULL;
+    }
 
     /* We have to associate our handle/locks with the process->pool otherwise
      * we won't be able to get at it from the remote_fetch_image function.  This
      * pool doesn't seem to go away when the child process goes away so we
      * have to register the clean up method below.
      */
-    apr_pool_userdata_set(locks, DIMS_CURL_SHARED_KEY, NULL, s->process->pool);
+    status = apr_pool_userdata_set(locks, DIMS_CURL_SHARED_KEY, NULL, s->process->pool);
+    if (status != APR_SUCCESS) {
+        ap_log_error(APLOG_MARK, APLOG_ERR, status, s,
+                     "mod_dims: failed to register curl shared state in process pool");
+        goto fail;
+    }
+
+    if (config->enable_op_cache) {
+        op_cache = apr_pcalloc(p, sizeof(*op_cache));
+        if (op_cache != NULL) {
+            op_cache->map = apr_hash_make(p);
+            op_cache->fifo_keys = apr_array_make(p, 128, sizeof(const char *));
+            op_cache->max_entries = (config->op_cache_size > 0) ?
+                (apr_uint32_t) config->op_cache_size :
+                DIMS_DEFAULT_OP_CACHE_SIZE;
+            status = apr_thread_mutex_create(&op_cache->mutex, APR_THREAD_MUTEX_DEFAULT, p);
+            if (status != APR_SUCCESS) {
+                ap_log_error(APLOG_MARK, APLOG_WARNING, status, s,
+                             "mod_dims: failed to create op-cache mutex; disabling op cache");
+                op_cache = NULL;
+            } else {
+                status = apr_pool_userdata_set(op_cache, DIMS_OP_CACHE_KEY, NULL, s->process->pool);
+                if (status != APR_SUCCESS) {
+                    ap_log_error(APLOG_MARK, APLOG_WARNING, status, s,
+                                 "mod_dims: failed to register op cache; disabling op cache");
+                }
+            }
+        }
+    }
 
     /* Register cleanup with the 'p' pool so we can clean up the locks and
      * shared curl handle when this process dies.
      */
     apr_pool_cleanup_register(p, locks, dims_child_cleanup, dims_child_cleanup);
+    return;
+
+fail:
+    if (locks != NULL) {
+        if (locks->share != NULL) {
+            curl_share_cleanup(locks->share);
+            locks->share = NULL;
+        }
+        if (locks->share_mutex != NULL) {
+            apr_thread_mutex_destroy(locks->share_mutex);
+            locks->share_mutex = NULL;
+        }
+        if (locks->dns_mutex != NULL) {
+            apr_thread_mutex_destroy(locks->dns_mutex);
+            locks->dns_mutex = NULL;
+        }
+    }
+    if (curl_initialized) {
+        curl_global_cleanup();
+    }
+    if (magick_initialized) {
+        MagickWandTerminus();
+    }
 }
 
 static void 
@@ -3112,6 +3710,26 @@ static const command_rec dims_commands[] =
                 dims_config_set_strict_validation, NULL, RSRC_CONF,
                 "Whether strict validation should be enabled for signatures and query params."
                 "The default is false."),
+    AP_INIT_TAKE1("DimsStatusExtended",
+                dims_config_set_status_extended, NULL, RSRC_CONF,
+                "Whether dims-status should include extended latency/cache metrics."
+                "The default is false."),
+    AP_INIT_TAKE1("DimsEnableOpCache",
+                dims_config_set_enable_op_cache, NULL, RSRC_CONF,
+                "Whether parsed command operation caching is enabled."
+                "The default is true."),
+    AP_INIT_TAKE1("DimsOpCacheSize",
+                dims_config_set_op_cache_size, NULL, RSRC_CONF,
+                "Maximum number of parsed command entries to store in the op cache."
+                "The default is 10000."),
+    AP_INIT_TAKE1("DimsFetchConnectionReuse",
+                dims_config_set_fetch_connection_reuse, NULL, RSRC_CONF,
+                "Whether to reuse libcurl easy handles per child process."
+                "The default is true."),
+    AP_INIT_TAKE1("DimsMaxConcurrentFetchesPerChild",
+                dims_config_set_max_concurrent_fetches_per_child, NULL, RSRC_CONF,
+                "Maximum concurrent upstream fetches allowed per Apache child process."
+                "The default is 32."),
     AP_INIT_TAKE1("DimsDefaultOutputFormat",
                 dims_config_set_default_output_format, NULL, RSRC_CONF,
                 "Default output format if 'format' command is not present in the request."),

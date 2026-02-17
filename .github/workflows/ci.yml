@@ -31,3 +31,53 @@ jobs:
 
       - name: Config smoke checks
         run: tests/config-smoke.sh
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 openssl curl
+
+      - name: Hardening integration tests
+        run: tests/hardening-integration.sh
+
+      - name: Performance smoke benchmark
+        env:
+          IMAGE_TAG: mod-dims:hardening-itest
+          SKIP_BUILD: "true"
+          REQUESTS: "60"
+          P95_LIMIT_MS: "400"
+        run: tests/perf-smoke.sh
+
+  sanitize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            autoconf automake libtool pkg-config build-essential \
+            apache2-dev libcurl4-openssl-dev \
+            libmagickwand-dev libmagickcore-dev \
+            libssl-dev
+
+      - name: Bootstrap
+        run: ./autorun.sh
+
+      - name: Configure with sanitizers
+        env:
+          CFLAGS: "-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined"
+          LDFLAGS: "-fsanitize=address,undefined"
+        run: ./configure
+
+      - name: Build with sanitizers
+        env:
+          CFLAGS: "-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined"
+          LDFLAGS: "-fsanitize=address,undefined"
+        run: make -j"$(nproc)"

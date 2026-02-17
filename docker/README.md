@@ -55,3 +55,8 @@ $ docker run -e DIMS_WHITELIST="images.pexels.com" mod-dims:latest
 | `DIMS_NO_IMAGE_CACHE_EXPIRE` | Time to cache "no image" (i.e. dims failures), in seconds | 60 |
 | `DIMS_SIGNATURE_ALGORITHM` | Signature mode for `/dims4/` (`legacy-md5` or `hmac-sha256`) | `legacy-md5` |
 | `DIMS_STRICT_VALIDATION` | Enable stricter signature/query validation rules (`true`/`false`) | `false` |
+| `DIMS_STATUS_EXTENDED` | Enable extended latency/cache metrics in `/dims-status/` (`true`/`false`) | `false` |
+| `DIMS_ENABLE_OP_CACHE` | Enable parsed command operation cache (`true`/`false`) | `true` |
+| `DIMS_OP_CACHE_SIZE` | Max number of parsed command cache entries | 10000 |
+| `DIMS_FETCH_CONNECTION_REUSE` | Reuse libcurl easy handles per child process (`true`/`false`) | `true` |
+| `DIMS_MAX_CONCURRENT_FETCHES_PER_CHILD` | Max concurrent upstream fetches per child process | 32 |

@@ -16,6 +16,10 @@ Run end-to-end hardening integration tests (requires Docker, Python 3, OpenSSL, 
 
     ./tests/hardening-integration.sh
 
+Run performance smoke benchmark (quick p95 guardrail):
+
+    ./tests/perf-smoke.sh
+
 Compiling
 =========
 
@@ -59,6 +63,11 @@ Add the following to the Apache configuration:
     # DimsLogSensitiveData false
     # DimsEncryptionAlgorithm AES/GCM/NoPadding
     # DimsAllowLegacyEcb false
+    # DimsStatusExtended true
+    # DimsEnableOpCache true
+    # DimsOpCacheSize 10000
+    # DimsFetchConnectionReuse true
+    # DimsMaxConcurrentFetchesPerChild 32
 
 This assumes mod_dims.so has been installed in $HTTP_ROOT/modules.
 
@@ -84,6 +93,24 @@ Recommended defaults for safer upstream fetch behavior:
     DimsMaxRedirects 5
     DimsConnectTimeout 1000
     DimsLogSensitiveData false
+    DimsFetchConnectionReuse true
+    DimsMaxConcurrentFetchesPerChild 32
+
+Performance & Scale Controls
+============================
+
+Performance-oriented directives:
+
+    DimsEnableOpCache true
+    DimsOpCacheSize 10000
+    DimsFetchConnectionReuse true
+    DimsMaxConcurrentFetchesPerChild 32
+
+Extended status metrics:
+
+    DimsStatusExtended true
+
+When enabled, `/dims-status/` includes approximate latency percentiles, op-cache hit ratio, and fetch-handle reuse ratio.
 
 Encrypted `eurl` recommendations:
 
