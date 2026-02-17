@@ -14,7 +14,9 @@ EXTRA_DIST = \
 	tests/hardening-integration.sh \
 	tests/hardening_fixture_server.py \
 	tests/perf-smoke.sh \
-	.github/workflows/ci.yml
+	scripts/update-imagemagick-version.sh \
+	.github/workflows/ci.yml \
+	.github/workflows/imagemagick-updater.yml
 
 TEST_IMAGE_TAG = mod-dims:make-check
 TEST_REQUESTS = 60

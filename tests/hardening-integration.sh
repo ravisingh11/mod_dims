@@ -8,6 +8,7 @@ SOURCE_BIND_HOST="${SOURCE_BIND_HOST:-0.0.0.0}"
 BASE_DIMS_PORT="${BASE_DIMS_PORT:-18000}"
 ECB_OFF_DIMS_PORT="${ECB_OFF_DIMS_PORT:-18001}"
 ECB_ON_DIMS_PORT="${ECB_ON_DIMS_PORT:-18002}"
+STRICT_DIMS4_PORT="${STRICT_DIMS4_PORT:-18003}"
 SECRET="${SECRET:-integration-secret}"
 
 FIXTURE_PID=""
@@ -18,7 +19,7 @@ cleanup() {
     kill "${FIXTURE_PID}" || true
     wait "${FIXTURE_PID}" 2>/dev/null || true
   fi
-  docker rm -f dims-itest-base dims-itest-ecb-off dims-itest-ecb-on >/dev/null 2>&1 || true
+  docker rm -f dims-itest-base dims-itest-ecb-off dims-itest-ecb-on dims-itest-dims4-strict >/dev/null 2>&1 || true
   exit "${status}"
 }
 trap cleanup EXIT
@@ -81,6 +82,34 @@ request_code() {
   curl -sS -o /tmp/mod_dims_itest_body.bin -w "%{http_code}" "${url}"
 }
 
+dims4_hash() {
+  local algorithm="$1"
+  local secret="$2"
+  local expires="$3"
+  local commands="$4"
+  local image_url="$5"
+  local signed_values_csv="${6:-}"
+
+  python3 - "$algorithm" "$secret" "$expires" "$commands" "$image_url" "$signed_values_csv" <<'PY'
+import hashlib
+import hmac
+import sys
+
+algorithm, secret, expires, commands, image_url, signed_values_csv = sys.argv[1:]
+payload = f"{expires}{secret}{commands}{image_url}"
+if signed_values_csv:
+    for value in signed_values_csv.split(","):
+        payload += value
+
+if algorithm == "hmac-sha256":
+    print(hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest())
+elif algorithm == "legacy-md5":
+    print(hashlib.md5(payload.encode("utf-8")).hexdigest())
+else:
+    raise SystemExit(f"unsupported algorithm: {algorithm}")
+PY
+}
+
 echo "Building integration test image: ${IMAGE_TAG}"
 docker build -t "${IMAGE_TAG}" -f "${ROOT_DIR}/docker/Dockerfile" "${ROOT_DIR}" >/dev/null
 
@@ -111,6 +140,55 @@ assert_status 500 "${code}" "max download bytes enforcement"
 
 code="$(request_code "http://127.0.0.1:${BASE_DIMS_PORT}/dims3/development/resize/1x1?url=${REDIRECT_URL}")"
 assert_status 500 "${code}" "max redirects enforcement"
+
+echo "Running parser edge-case tests"
+code="$(request_code "http://127.0.0.1:${BASE_DIMS_PORT}/dims3/development/resize/?url=${GOOD_URL}")"
+assert_status 200 "${code}" "empty resize args tolerated"
+
+code="$(request_code "http://127.0.0.1:${BASE_DIMS_PORT}/dims3/development/format/?url=${GOOD_URL}")"
+assert_status 400 "${code}" "empty format args rejected"
+
+echo "Running dims4 signature tests (legacy-md5 relaxed)"
+DIMS4_EXPIRES="$(python3 - <<'PY'
+import time
+print(int(time.time()) + 3600)
+PY
+)"
+DIMS4_COMMANDS="resize/1x1"
+DIMS4_IMAGE_URL="http://host.docker.internal:${SOURCE_PORT}/image.png"
+DIMS4_IMAGE_URL_ESCAPED="$(urlencode "${DIMS4_IMAGE_URL}")"
+
+LEGACY_MD5_FULL_HASH="$(dims4_hash legacy-md5 "${SECRET}" "${DIMS4_EXPIRES}" "${DIMS4_COMMANDS}" "${DIMS4_IMAGE_URL}")"
+LEGACY_MD5_SHORT_HASH="${LEGACY_MD5_FULL_HASH:0:6}"
+LEGACY_MD5_BAD_HASH="deadbe"
+
+code="$(request_code "http://127.0.0.1:${BASE_DIMS_PORT}/dims4/development/${LEGACY_MD5_SHORT_HASH}/${DIMS4_EXPIRES}/${DIMS4_COMMANDS}?url=${DIMS4_IMAGE_URL_ESCAPED}")"
+assert_status 200 "${code}" "dims4 legacy-md5 short signature accepted in non-strict mode"
+
+code="$(request_code "http://127.0.0.1:${BASE_DIMS_PORT}/dims4/development/${LEGACY_MD5_BAD_HASH}/${DIMS4_EXPIRES}/${DIMS4_COMMANDS}?url=${DIMS4_IMAGE_URL_ESCAPED}")"
+assert_status 400 "${code}" "dims4 legacy-md5 bad signature rejected"
+
+echo "Running dims4 signature tests (hmac-sha256 strict)"
+run_dims_container "dims-itest-dims4-strict" "${STRICT_DIMS4_PORT}" \
+  -e DIMS_SIGNATURE_ALGORITHM=hmac-sha256 \
+  -e DIMS_STRICT_VALIDATION=true
+
+HMAC_FULL_HASH="$(dims4_hash hmac-sha256 "${SECRET}" "${DIMS4_EXPIRES}" "${DIMS4_COMMANDS}" "${DIMS4_IMAGE_URL}")"
+HMAC_SHORT_HASH="${HMAC_FULL_HASH:0:12}"
+
+code="$(request_code "http://127.0.0.1:${STRICT_DIMS4_PORT}/dims4/development/${HMAC_FULL_HASH}/${DIMS4_EXPIRES}/${DIMS4_COMMANDS}?url=${DIMS4_IMAGE_URL_ESCAPED}")"
+assert_status 200 "${code}" "dims4 hmac-sha256 full signature accepted in strict mode"
+
+code="$(request_code "http://127.0.0.1:${STRICT_DIMS4_PORT}/dims4/development/${HMAC_SHORT_HASH}/${DIMS4_EXPIRES}/${DIMS4_COMMANDS}?url=${DIMS4_IMAGE_URL_ESCAPED}")"
+assert_status 400 "${code}" "dims4 hmac-sha256 short signature rejected in strict mode"
+
+# Signed query parameters: strict mode requires every _keys entry to be present.
+code="$(request_code "http://127.0.0.1:${STRICT_DIMS4_PORT}/dims4/development/${HMAC_FULL_HASH}/${DIMS4_EXPIRES}/${DIMS4_COMMANDS}?url=${DIMS4_IMAGE_URL_ESCAPED}&_keys=download,optimizeResize&download=1")"
+assert_status 400 "${code}" "strict mode rejects missing signed query parameter listed in _keys"
+
+HMAC_WITH_KEYS="$(dims4_hash hmac-sha256 "${SECRET}" "${DIMS4_EXPIRES}" "${DIMS4_COMMANDS}" "${DIMS4_IMAGE_URL}" "1,2")"
+code="$(request_code "http://127.0.0.1:${STRICT_DIMS4_PORT}/dims4/development/${HMAC_WITH_KEYS}/${DIMS4_EXPIRES}/${DIMS4_COMMANDS}?url=${DIMS4_IMAGE_URL_ESCAPED}&_keys=download,optimizeResize&download=1&optimizeResize=2")"
+assert_status 200 "${code}" "strict mode accepts valid signed _keys parameters"
 
 echo "Running hardening integration tests (legacy ECB disabled)"
 run_dims_container "dims-itest-ecb-off" "${ECB_OFF_DIMS_PORT}" \

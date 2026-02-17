@@ -2,8 +2,10 @@ Dependencies
 ============
 
 * Apache 2.4+
-* ImageMagick 6.9+ or 7.x (Docker/devcontainer builds fetch the latest release tarball at build time)
+* ImageMagick 6.9+ or 7.x (Docker/devcontainer builds pin a version + SHA256)
 * libcurl 8+
+
+The ImageMagick pin is updated automatically by `.github/workflows/imagemagick-updater.yml`.
 
 Testing
 =======

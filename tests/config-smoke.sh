@@ -21,5 +21,9 @@ grep -Eq "^DimsEnableOpCache[[:space:]]+\\$\\{DIMS_ENABLE_OP_CACHE\\}$" docker/d
 grep -Eq "^DimsOpCacheSize[[:space:]]+\\$\\{DIMS_OP_CACHE_SIZE\\}$" docker/dims.conf
 grep -Eq "^DimsFetchConnectionReuse[[:space:]]+\\$\\{DIMS_FETCH_CONNECTION_REUSE\\}$" docker/dims.conf
 grep -Eq "^DimsMaxConcurrentFetchesPerChild[[:space:]]+\\$\\{DIMS_MAX_CONCURRENT_FETCHES_PER_CHILD\\}$" docker/dims.conf
+grep -Eq "^ARG IMAGEMAGICK_VERSION=[0-9]+\\.[0-9]+\\.[0-9]+-[0-9]+$" docker/Dockerfile
+grep -Eq "^ARG IMAGEMAGICK_SHA256=[a-f0-9]{64}$" docker/Dockerfile
+grep -Eq "^ARG IMAGEMAGICK_VERSION=[0-9]+\\.[0-9]+\\.[0-9]+-[0-9]+$" .devcontainer/Dockerfile
+grep -Eq "^ARG IMAGEMAGICK_SHA256=[a-f0-9]{64}$" .devcontainer/Dockerfile
 
 echo "config-smoke: ok"

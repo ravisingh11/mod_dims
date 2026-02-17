@@ -1,0 +1,31 @@
+name: imagemagick-updater
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update ImageMagick version pin
+        run: ./scripts/update-imagemagick-version.sh
+
+      - name: Create pull request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: chore/update-imagemagick-pin
+          delete-branch: true
+          commit-message: "chore: update ImageMagick version pin"
+          title: "chore: update ImageMagick version pin"
+          body: |
+            Automated update of pinned ImageMagick version + checksum in Docker build files.
+
+            This PR was created by `.github/workflows/imagemagick-updater.yml`.
