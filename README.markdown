@@ -20,6 +20,37 @@ Run performance smoke benchmark (quick p95 guardrail):
 
     ./tests/perf-smoke.sh
 
+QA: Test with Custom JPG/PNG/WebP Files
+=======================================
+
+Use this flow to test real image files from a local folder.
+
+1. Start a local file server from your image directory:
+
+       cd /path/to/qa-images
+       python3 -m http.server 19090
+
+2. Run mod_dims in Docker and allow that source host:
+
+       docker run --rm -p 8000:8000 \
+         --add-host host.docker.internal:host-gateway \
+         -e DIMS_CLIENT=development \
+         -e DIMS_SECRET=mysecret \
+         -e DIMS_WHITELIST=host.docker.internal \
+         mod-dims:qa
+
+3. In another terminal, URL-encode your source image and request a dims URL:
+
+       ENCODED_URL="$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "http://host.docker.internal:19090/sample.jpg")"
+       curl -i "http://127.0.0.1:8000/dims3/development/resize/400x400?url=${ENCODED_URL}"
+
+Suggested QA checks per file:
+
+* resize: `/resize/400x400`
+* crop: `/crop/200x200+0+0`
+* format conversion: add `/format/webp` or `/format/jpeg`
+* quality: add `/quality/80`
+
 Compiling
 =========
 
