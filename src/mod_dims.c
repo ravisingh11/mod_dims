@@ -61,10 +61,11 @@ module dims_module;
 #define DIMS_CURL_SHARED_KEY "dims_curl_shared"
 #define DIMS_OP_CACHE_KEY "dims_op_cache"
 #define DIMS_DEFAULT_CONNECT_TIMEOUT 1000
-#define DIMS_DEFAULT_MAX_DOWNLOAD_BYTES (64L * 1024L * 1024L)
-#define DIMS_DEFAULT_MAX_REDIRECTS 5
+#define DIMS_DEFAULT_MAX_DOWNLOAD_BYTES 0
+#define DIMS_DEFAULT_MAX_REDIRECTS -1
 #define DIMS_DEFAULT_OP_CACHE_SIZE 10000
 #define DIMS_DEFAULT_MAX_CONCURRENT_FETCHES_PER_CHILD 32
+#define DIMS_FETCH_SCHEMES_ALL "all"
 #define DIMS_LATENCY_BUCKET_BOUND_COUNT 12
 #define DIMS_LATENCY_BUCKET_COUNT (DIMS_LATENCY_BUCKET_BOUND_COUNT + 1)
 
@@ -230,6 +231,42 @@ dims_is_supported_fetch_scheme(const char *scheme, size_t length)
 }
 
 static int
+dims_is_all_fetch_schemes(const char *schemes)
+{
+    const char *cursor;
+
+    if (schemes == NULL) {
+        return 0;
+    }
+
+    cursor = schemes;
+    while (*cursor != '\0' && apr_isspace(*cursor)) {
+        cursor++;
+    }
+
+    if (strncasecmp(cursor, DIMS_FETCH_SCHEMES_ALL, strlen(DIMS_FETCH_SCHEMES_ALL)) != 0) {
+        return 0;
+    }
+
+    cursor += strlen(DIMS_FETCH_SCHEMES_ALL);
+    while (*cursor != '\0' && apr_isspace(*cursor)) {
+        cursor++;
+    }
+
+    return *cursor == '\0';
+}
+
+static int
+dims_should_enforce_fetch_scheme_policy(const char *schemes)
+{
+    if (schemes == NULL || *schemes == '\0') {
+        return 0;
+    }
+
+    return !dims_is_all_fetch_schemes(schemes);
+}
+
+static int
 dims_are_fetch_schemes_valid(const char *schemes)
 {
     const char *cursor = schemes;
@@ -237,6 +274,10 @@ dims_are_fetch_schemes_valid(const char *schemes)
 
     if (schemes == NULL || *schemes == '\0') {
         return 0;
+    }
+
+    if (dims_is_all_fetch_schemes(schemes)) {
+        return 1;
     }
 
     while (*cursor != '\0') {
@@ -273,9 +314,12 @@ dims_is_fetch_scheme_allowed(const char *allowed_schemes, const char *scheme)
     const char *cursor = allowed_schemes;
     size_t scheme_length;
 
-    if (scheme == NULL || *scheme == '\0' ||
-        allowed_schemes == NULL || *allowed_schemes == '\0') {
+    if (scheme == NULL || *scheme == '\0') {
         return 0;
+    }
+
+    if (!dims_should_enforce_fetch_scheme_policy(allowed_schemes)) {
+        return 1;
     }
 
     scheme_length = strlen(scheme);
@@ -718,9 +762,9 @@ dims_create_config(apr_pool_t *p, server_rec *s)
     config->disable_encoded_fetch = 0;
     config->max_download_bytes = DIMS_DEFAULT_MAX_DOWNLOAD_BYTES;
     config->max_redirects = DIMS_DEFAULT_MAX_REDIRECTS;
-    config->allowed_fetch_schemes = apr_pstrdup(p, "http,https");
+    config->allowed_fetch_schemes = NULL;
     config->log_sensitive_data = 0;
-    config->allow_legacy_ecb = 0;
+    config->allow_legacy_ecb = 1;
     config->default_output_format = NULL;
     config->status_extended = 0;
     config->enable_op_cache = 1;
@@ -736,7 +780,7 @@ dims_create_config(apr_pool_t *p, server_rec *s)
     config->curl_queue_size = 10;
     config->cache_dir = NULL;
     config->secret_key = apr_pstrdup(p,"m0d1ms");
-    config->encryption_algorithm = "AES/GCM/NoPadding";
+    config->encryption_algorithm = "AES/ECB/PKCS5Padding";
     config->signature_algorithm = DIMS_SIGNATURE_ALGORITHM_LEGACY_MD5;
     config->strict_validation = 0;
     config->max_expiry_period= 0; // never expire
@@ -938,8 +982,8 @@ dims_config_set_max_download_bytes(cmd_parms *cmd, void *dummy, const char *arg)
             cmd->server->module_config, &dims_module);
     long value = 0;
 
-    if (!dims_parse_long_value(arg, 1, LONG_MAX, &value)) {
-        return "DimsMaxDownloadBytes must be a positive integer in bytes.";
+    if (!dims_parse_long_value(arg, 0, LONG_MAX, &value)) {
+        return "DimsMaxDownloadBytes must be a non-negative integer in bytes (0 disables limit).";
     }
 
     config->max_download_bytes = value;
@@ -953,8 +997,8 @@ dims_config_set_max_redirects(cmd_parms *cmd, void *dummy, const char *arg)
             cmd->server->module_config, &dims_module);
     long value = 0;
 
-    if (!dims_parse_long_value(arg, 0, LONG_MAX, &value)) {
-        return "DimsMaxRedirects must be a non-negative integer.";
+    if (!dims_parse_long_value(arg, -1, LONG_MAX, &value)) {
+        return "DimsMaxRedirects must be a non-negative integer (-1 disables limit).";
     }
 
     config->max_redirects = value;
@@ -968,7 +1012,7 @@ dims_config_set_allowed_fetch_schemes(cmd_parms *cmd, void *dummy, const char *a
             cmd->server->module_config, &dims_module);
 
     if (!dims_are_fetch_schemes_valid(arg)) {
-        return "DimsAllowedFetchSchemes must contain only comma-separated values from: http,https.";
+        return "DimsAllowedFetchSchemes must be 'all' or contain only comma-separated values from: http,https.";
     }
 
     config->allowed_fetch_schemes = (char *) arg;
@@ -1646,11 +1690,6 @@ dims_get_image_data(dims_request_rec *d, char *fetch_url, dims_image_data_t *dat
         }
     }
 
-    if (!dims_build_curl_protocol_mask(d->config->allowed_fetch_schemes, &protocol_mask)) {
-        result_code = CURLE_UNSUPPORTED_PROTOCOL;
-        goto cleanup;
-    }
-
     if (locks != NULL && d->config->fetch_connection_reuse && locks->easy_queue != NULL) {
         void *queue_item = NULL;
         if (apr_queue_trypop(locks->easy_queue, &queue_item) == APR_SUCCESS && queue_item != NULL) {
@@ -1677,17 +1716,25 @@ dims_get_image_data(dims_request_rec *d, char *fetch_url, dims_image_data_t *dat
     curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT_MS, (long) d->config->connect_timeout);
     curl_easy_setopt(curl_handle, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl_handle, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl_handle, CURLOPT_MAXREDIRS, (long) d->config->max_redirects);
+    if (d->config->max_redirects >= 0) {
+        curl_easy_setopt(curl_handle, CURLOPT_MAXREDIRS, (long) d->config->max_redirects);
+    }
     curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYHOST, 2L);
     curl_easy_setopt(curl_handle, CURLOPT_VERBOSE, 0L);
+    if (dims_should_enforce_fetch_scheme_policy(d->config->allowed_fetch_schemes)) {
+        if (!dims_build_curl_protocol_mask(d->config->allowed_fetch_schemes, &protocol_mask)) {
+            result_code = CURLE_UNSUPPORTED_PROTOCOL;
+            goto cleanup;
+        }
 #ifdef CURLOPT_PROTOCOLS_STR
-    curl_easy_setopt(curl_handle, CURLOPT_PROTOCOLS_STR, d->config->allowed_fetch_schemes);
-    curl_easy_setopt(curl_handle, CURLOPT_REDIR_PROTOCOLS_STR, d->config->allowed_fetch_schemes);
+        curl_easy_setopt(curl_handle, CURLOPT_PROTOCOLS_STR, d->config->allowed_fetch_schemes);
+        curl_easy_setopt(curl_handle, CURLOPT_REDIR_PROTOCOLS_STR, d->config->allowed_fetch_schemes);
 #else
-    curl_easy_setopt(curl_handle, CURLOPT_PROTOCOLS, protocol_mask);
-    curl_easy_setopt(curl_handle, CURLOPT_REDIR_PROTOCOLS, protocol_mask);
+        curl_easy_setopt(curl_handle, CURLOPT_PROTOCOLS, protocol_mask);
+        curl_easy_setopt(curl_handle, CURLOPT_REDIR_PROTOCOLS, protocol_mask);
 #endif
+    }
 
     /* Set the user agent to dims/<version> */
     if (d->config->user_agent_override != NULL && d->config->user_agent_enabled == 1) {
@@ -2617,8 +2664,9 @@ dims_handle_request(dims_request_rec *d)
             return dims_cleanup(d, "Invalid URL in request.", DIMS_BAD_URL);
         }
 
-        if (uri.scheme == NULL ||
-            !dims_is_fetch_scheme_allowed(d->config->allowed_fetch_schemes, uri.scheme)) {
+        if (dims_should_enforce_fetch_scheme_policy(d->config->allowed_fetch_schemes) &&
+            (uri.scheme == NULL ||
+             !dims_is_fetch_scheme_allowed(d->config->allowed_fetch_schemes, uri.scheme))) {
             return dims_cleanup(d, "Invalid URL scheme in request.", DIMS_BAD_URL);
         }
 
@@ -2698,8 +2746,9 @@ dims_sizer(dims_request_rec *d)
     if(apr_uri_parse(d->pool, d->image_url, &uri) != APR_SUCCESS) {
         return dims_cleanup(d, "Invalid URL in request.", DIMS_BAD_URL);
     }
-    if (uri.scheme == NULL ||
-        !dims_is_fetch_scheme_allowed(d->config->allowed_fetch_schemes, uri.scheme)) {
+    if (dims_should_enforce_fetch_scheme_policy(d->config->allowed_fetch_schemes) &&
+        (uri.scheme == NULL ||
+         !dims_is_fetch_scheme_allowed(d->config->allowed_fetch_schemes, uri.scheme))) {
         return dims_cleanup(d, "Invalid URL scheme in request.", DIMS_BAD_URL);
     }
     if(dims_fetch_remote_image(d, d->image_url ) != 0) {
@@ -3194,7 +3243,8 @@ dims_handler(request_rec *r)
         ap_rprintf(r, "Connect timeout (ms): %d\n", d->config->connect_timeout);
         ap_rprintf(r, "Max download bytes: %ld\n", d->config->max_download_bytes);
         ap_rprintf(r, "Max redirects: %ld\n", d->config->max_redirects);
-        ap_rprintf(r, "Allowed fetch schemes: %s\n", d->config->allowed_fetch_schemes);
+        ap_rprintf(r, "Allowed fetch schemes: %s\n",
+                d->config->allowed_fetch_schemes != NULL ? d->config->allowed_fetch_schemes : DIMS_FETCH_SCHEMES_ALL);
         ap_rprintf(r, "Log sensitive data: %s\n", d->config->log_sensitive_data ? "true" : "false");
         ap_rprintf(r, "Allow legacy ECB: %s\n", d->config->allow_legacy_ecb ? "true" : "false");
         ap_rprintf(r, "Status extended: %s\n", d->config->status_extended ? "true" : "false");

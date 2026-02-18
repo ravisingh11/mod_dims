@@ -32,6 +32,8 @@ $ docker run -e DIMS_WHITELIST="images.pexels.com" mod-dims:latest
 
 ## Configuration
 
+Defaults are compatibility-first. Enable stricter hardening by overriding the relevant environment variables.
+
 | Environment Variables | Description | Default |
 |-----------------------|-------------|---------|
 | `DIMS_CLIENT` | Name of client | development |
@@ -40,12 +42,12 @@ $ docker run -e DIMS_WHITELIST="images.pexels.com" mod-dims:latest
 | `DIMS_DOWNLOAD_TIMEOUT` | Max time allowed for downloading source images, in milliseconds. | 60000 |
 | `DIMS_CONNECT_TIMEOUT` | Max time allowed to establish upstream connection, in milliseconds. | 1000 |
 | `DIMS_IMAGEMAGICK_TIMEOUT` | Max time allowed for ImageMagick processing, in milliseconds. | 20000 |
-| `DIMS_MAX_DOWNLOAD_BYTES` | Hard cap for downloaded source image size, in bytes. | 67108864 |
-| `DIMS_MAX_REDIRECTS` | Max redirect hops for upstream fetches. | 5 |
-| `DIMS_ALLOWED_FETCH_SCHEMES` | Comma-separated allowed upstream schemes. | `http,https` |
+| `DIMS_MAX_DOWNLOAD_BYTES` | Hard cap for downloaded source image size, in bytes (`0` disables cap). | 0 |
+| `DIMS_MAX_REDIRECTS` | Max redirect hops for upstream fetches (`-1` disables cap). | -1 |
+| `DIMS_ALLOWED_FETCH_SCHEMES` | Upstream scheme policy (`all` or comma-separated list like `http,https`). | `all` |
 | `DIMS_LOG_SENSITIVE_DATA` | Enable sensitive URL/signature logs (`true`/`false`). | `false` |
-| `DIMS_ENCRYPTION_ALGORITHM` | `eurl` algorithm (`AES/GCM/NoPadding` or `AES/ECB/PKCS5Padding`). | `AES/GCM/NoPadding` |
-| `DIMS_ALLOW_LEGACY_ECB` | Allow legacy ECB encrypted URLs (`true`/`false`). | `false` |
+| `DIMS_ENCRYPTION_ALGORITHM` | `eurl` algorithm (`AES/GCM/NoPadding` or `AES/ECB/PKCS5Padding`). | `AES/ECB/PKCS5Padding` |
+| `DIMS_ALLOW_LEGACY_ECB` | Allow legacy ECB encrypted URLs (`true`/`false`). | `true` |
 | `DIMS_NO_IMAGE_URL` | URL (http(s):// or file:///) to an image displayed for errors | "http://placehold.it/350x150" |
 | `DIMS_DEFAULT_IMAGE_URL` | URL used as default/fallback image | "http://placehold.it/350x150" |
 | `DIMS_CACHE_CONTROL_MAX_AGE` | Cache control max age header setting, in seconds | 604800 |

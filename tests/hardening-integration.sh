@@ -9,6 +9,7 @@ BASE_DIMS_PORT="${BASE_DIMS_PORT:-18000}"
 ECB_OFF_DIMS_PORT="${ECB_OFF_DIMS_PORT:-18001}"
 ECB_ON_DIMS_PORT="${ECB_ON_DIMS_PORT:-18002}"
 STRICT_DIMS4_PORT="${STRICT_DIMS4_PORT:-18003}"
+ECB_DEFAULT_DIMS_PORT="${ECB_DEFAULT_DIMS_PORT:-18004}"
 SECRET="${SECRET:-integration-secret}"
 
 FIXTURE_PID=""
@@ -19,7 +20,7 @@ cleanup() {
     kill "${FIXTURE_PID}" || true
     wait "${FIXTURE_PID}" 2>/dev/null || true
   fi
-  docker rm -f dims-itest-base dims-itest-ecb-off dims-itest-ecb-on dims-itest-dims4-strict >/dev/null 2>&1 || true
+  docker rm -f dims-itest-base dims-itest-ecb-off dims-itest-ecb-on dims-itest-dims4-strict dims-itest-ecb-default >/dev/null 2>&1 || true
   exit "${status}"
 }
 trap cleanup EXIT
@@ -190,11 +191,6 @@ HMAC_WITH_KEYS="$(dims4_hash hmac-sha256 "${SECRET}" "${DIMS4_EXPIRES}" "${DIMS4
 code="$(request_code "http://127.0.0.1:${STRICT_DIMS4_PORT}/dims4/development/${HMAC_WITH_KEYS}/${DIMS4_EXPIRES}/${DIMS4_COMMANDS}?url=${DIMS4_IMAGE_URL_ESCAPED}&_keys=download,optimizeResize&download=1&optimizeResize=2")"
 assert_status 200 "${code}" "strict mode accepts valid signed _keys parameters"
 
-echo "Running hardening integration tests (legacy ECB disabled)"
-run_dims_container "dims-itest-ecb-off" "${ECB_OFF_DIMS_PORT}" \
-  -e DIMS_ENCRYPTION_ALGORITHM="AES/ECB/PKCS5Padding" \
-  -e DIMS_ALLOW_LEGACY_ECB=false
-
 KEY_HEX="$(python3 - "${SECRET}" <<'PY'
 import hashlib
 import sys
@@ -205,6 +201,17 @@ PY
 ECB_PLAINTEXT="http://host.docker.internal:${SOURCE_PORT}/image.png"
 ECB_ENCRYPTED="$(printf '%s' "${ECB_PLAINTEXT}" | openssl enc -aes-128-ecb -K "${KEY_HEX}" -nosalt -base64 | tr -d '\n')"
 ECB_ENCRYPTED_ESCAPED="$(urlencode "${ECB_ENCRYPTED}")"
+
+echo "Running hardening integration tests (legacy ECB default compatibility)"
+run_dims_container "dims-itest-ecb-default" "${ECB_DEFAULT_DIMS_PORT}"
+
+code="$(request_code "http://127.0.0.1:${ECB_DEFAULT_DIMS_PORT}/dims3/development/resize/1x1?eurl=${ECB_ENCRYPTED_ESCAPED}")"
+assert_status 200 "${code}" "legacy ECB allowed by default for compatibility"
+
+echo "Running hardening integration tests (legacy ECB disabled)"
+run_dims_container "dims-itest-ecb-off" "${ECB_OFF_DIMS_PORT}" \
+  -e DIMS_ENCRYPTION_ALGORITHM="AES/ECB/PKCS5Padding" \
+  -e DIMS_ALLOW_LEGACY_ECB=false
 
 code="$(request_code "http://127.0.0.1:${ECB_OFF_DIMS_PORT}/dims3/development/resize/1x1?eurl=${ECB_ENCRYPTED_ESCAPED}")"
 assert_status 500 "${code}" "legacy ECB blocked by policy"

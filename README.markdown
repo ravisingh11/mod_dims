@@ -180,27 +180,24 @@ Backward Compatibility & Migration
 
 Are the behavior changes good?
 
-Yes for security. The stricter defaults reduce risk from weak crypto usage, unsafe URL handling, oversized downloads, and redirect abuse.
+Yes. Hardening controls are available, but defaults are compatibility-first to avoid breaking existing clients.
 
 What remains backward compatible:
 
 * `/dims3/` and `/dims4/` URL formats.
 * `dims4` signature verification using `legacy-md5` by default.
+* Legacy ECB `eurl` support is enabled by default.
+* Download/redirect caps and scheme restrictions are disabled by default unless configured.
 
-What can break older clients:
-
-* Legacy encrypted URLs (`eurl`) that rely on ECB now fail unless explicitly enabled.
-* Remote fetches now enforce scheme allowlist, download size limits, and redirect limits.
-
-Legacy compatibility profile (temporary migration mode):
+Compatibility profile (current default):
 
     DimsSignatureAlgorithm legacy-md5
     DimsStrictValidation false
     DimsEncryptionAlgorithm AES/ECB/PKCS5Padding
     DimsAllowLegacyEcb true
-    DimsAllowedFetchSchemes http,https
-    DimsMaxDownloadBytes 268435456
-    DimsMaxRedirects 10
+    DimsAllowedFetchSchemes all
+    DimsMaxDownloadBytes 0
+    DimsMaxRedirects -1
 
 Recommended hardened profile:
 

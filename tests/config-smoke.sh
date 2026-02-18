@@ -3,9 +3,11 @@ set -euo pipefail
 
 grep -Eq "^DimsSignatureAlgorithm[[:space:]]+legacy-md5$" examples/dims.conf
 grep -Eq "^DimsStrictValidation[[:space:]]+false$" examples/dims.conf
-grep -Eq "^DimsEncryptionAlgorithm[[:space:]]+AES/GCM/NoPadding$" examples/dims.conf
-grep -Eq "^DimsAllowLegacyEcb[[:space:]]+false$" examples/dims.conf
-grep -Eq "^DimsAllowedFetchSchemes[[:space:]]+http,https$" examples/dims.conf
+grep -Eq "^DimsEncryptionAlgorithm[[:space:]]+AES/ECB/PKCS5Padding$" examples/dims.conf
+grep -Eq "^DimsAllowLegacyEcb[[:space:]]+true$" examples/dims.conf
+grep -Eq "^DimsAllowedFetchSchemes[[:space:]]+all$" examples/dims.conf
+grep -Eq "^DimsMaxDownloadBytes[[:space:]]+0$" examples/dims.conf
+grep -Eq "^DimsMaxRedirects[[:space:]]+-1$" examples/dims.conf
 grep -Eq "^DimsStatusExtended[[:space:]]+false$" examples/dims.conf
 grep -Eq "^DimsEnableOpCache[[:space:]]+true$" examples/dims.conf
 grep -Eq "^DimsOpCacheSize[[:space:]]+10000$" examples/dims.conf
@@ -25,5 +27,10 @@ grep -Eq "^ARG IMAGEMAGICK_VERSION=[0-9]+\\.[0-9]+\\.[0-9]+-[0-9]+$" docker/Dock
 grep -Eq "^ARG IMAGEMAGICK_SHA256=[a-f0-9]{64}$" docker/Dockerfile
 grep -Eq "^ARG IMAGEMAGICK_VERSION=[0-9]+\\.[0-9]+\\.[0-9]+-[0-9]+$" .devcontainer/Dockerfile
 grep -Eq "^ARG IMAGEMAGICK_SHA256=[a-f0-9]{64}$" .devcontainer/Dockerfile
+grep -Eq "^ENV DIMS_MAX_DOWNLOAD_BYTES=0$" docker/Dockerfile
+grep -Eq "^ENV DIMS_MAX_REDIRECTS=-1$" docker/Dockerfile
+grep -Eq "^ENV DIMS_ALLOWED_FETCH_SCHEMES=\"all\"$" docker/Dockerfile
+grep -Eq "^ENV DIMS_ALLOW_LEGACY_ECB=\"true\"$" docker/Dockerfile
+grep -Eq "^ENV DIMS_ENCRYPTION_ALGORITHM=\"AES/ECB/PKCS5Padding\"$" docker/Dockerfile
 
 echo "config-smoke: ok"
