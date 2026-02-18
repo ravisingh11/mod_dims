@@ -36,6 +36,17 @@ assert_status() {
   echo "ok: ${name} -> ${actual}"
 }
 
+assert_contains() {
+  local haystack="$1"
+  local needle="$2"
+  local name="$3"
+  if [[ "${haystack}" != *"${needle}"* ]]; then
+    echo "FAIL: ${name} missing '${needle}'" >&2
+    return 1
+  fi
+  echo "ok: ${name}"
+}
+
 wait_http_ok() {
   local url="$1"
   local max_attempts="${2:-30}"
@@ -204,6 +215,15 @@ ECB_ENCRYPTED_ESCAPED="$(urlencode "${ECB_ENCRYPTED}")"
 
 echo "Running hardening integration tests (legacy ECB default compatibility)"
 run_dims_container "dims-itest-ecb-default" "${ECB_DEFAULT_DIMS_PORT}"
+
+code="$(request_code "http://127.0.0.1:${ECB_DEFAULT_DIMS_PORT}/dims3/development/resize/1x1?url=${REDIRECT_URL}")"
+assert_status 200 "${code}" "redirect chain allowed by default compatibility policy"
+
+status_body="$(curl -fsS "http://127.0.0.1:${ECB_DEFAULT_DIMS_PORT}/dims-status/")"
+assert_contains "${status_body}" "Allow legacy ECB: true" "default status reports legacy ECB allowed"
+assert_contains "${status_body}" "Max download bytes: 0" "default status reports download cap disabled"
+assert_contains "${status_body}" "Max redirects: -1" "default status reports redirect cap disabled"
+assert_contains "${status_body}" "Allowed fetch schemes: all" "default status reports unrestricted fetch schemes"
 
 code="$(request_code "http://127.0.0.1:${ECB_DEFAULT_DIMS_PORT}/dims3/development/resize/1x1?eurl=${ECB_ENCRYPTED_ESCAPED}")"
 assert_status 200 "${code}" "legacy ECB allowed by default for compatibility"
